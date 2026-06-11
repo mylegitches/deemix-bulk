@@ -10,6 +10,10 @@ artists.txt
 *.exe
 Readme.txt
 
+# runtime output / state
+logs/
+state/
+
 # python
 __pycache__/
 *.pyc
