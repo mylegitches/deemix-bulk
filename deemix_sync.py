@@ -259,6 +259,8 @@ def main():
     # Track the last-known state of each item so that when an active item
     # disappears we can inject it back as completed for this pass.
     seen_items = {}
+    nas_last_fail = 0        # timestamp of last NAS connect failure
+    NAS_RETRY_SECS = 300     # only retry the NAS every 5 min when unreachable
 
     while True:
         try:
@@ -342,12 +344,21 @@ def main():
                          src, dest_base or "<NAS>", os.path.basename(src))
                 continue
 
-            # Ensure SMB is connected before attempting a move (it may have
-            # been unavailable at startup or dropped since).
+            # Ensure SMB is connected before attempting a move.  When the NAS
+            # is known unreachable, skip the expensive net use timeout and only
+            # retry every NAS_RETRY_SECS seconds.
+            now = time.time()
+            if now - nas_last_fail < NAS_RETRY_SECS:
+                log.debug("    NAS in backoff, skipping move of %s", band)
+                move_failed.add(key)
+                continue
             try:
                 smb_connect(host, share, user, password, log)
+                nas_last_fail = 0  # connected OK — clear backoff
             except RuntimeError as e:
-                log.warning("    NAS still unreachable, skipping %s for now: %s", band, e)
+                nas_last_fail = now
+                log.warning("    NAS unreachable, skipping %s (retry in %ds): %s",
+                             band, NAS_RETRY_SECS, e)
                 move_failed.add(key)
                 continue
 
