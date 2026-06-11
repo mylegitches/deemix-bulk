@@ -60,7 +60,7 @@ def deezer(path):
     raise RuntimeError(f"Deezer API failed: {url} ({last})")
 
 
-def resolve_artist(entry):
+def resolve_artist(entry, use_ai=False):
     entry = entry.strip()
     if entry.isdigit():
         a = deezer(f"/artist/{entry}")
@@ -72,12 +72,32 @@ def resolve_artist(entry):
             return {"id": a["id"], "name": a["name"], "matched": True} if a.get("id") else None
         return None
     q = urllib.parse.quote(entry)
-    data = (deezer(f"/search/artist?q={q}&limit=5") or {}).get("data") or []
+    data = (deezer(f"/search/artist?q={q}&limit=10") or {}).get("data") or []
     if not data:
         return None
-    top = data[0]
-    return {"id": top["id"], "name": top["name"],
-            "matched": top["name"].strip().lower() == entry.lower()}
+
+    exact = [d for d in data if d["name"].strip().lower() == entry.lower()]
+    # A single exact name match is unambiguous -> take it, no AI call.
+    if len(exact) == 1:
+        d = exact[0]
+        return {"id": d["id"], "name": d["name"], "matched": True}
+
+    # Uncertain: several artists share the name, or none match exactly (Deezer's
+    # relevance hit may be the wrong same-ish artist). Ask the LLM if enabled.
+    if use_ai and dc.ai_enabled():
+        cid = dc.ai_pick_artist(entry, data[:6])
+        if cid:
+            d = next((x for x in data if x["id"] == cid), None)
+            if d:
+                return {"id": d["id"], "name": d["name"],
+                        "matched": d in exact, "ai": True}
+
+    # Heuristic fallback: best exact-name match by followers, else top hit.
+    if exact:
+        d = max(exact, key=lambda x: x.get("nb_fan", 0))
+        return {"id": d["id"], "name": d["name"], "matched": True}
+    d = data[0]
+    return {"id": d["id"], "name": d["name"], "matched": False}
 
 
 def get_all_albums(artist_id):
@@ -112,6 +132,8 @@ def parse_args():
                    help="Deezer ARL (else DEEMIX_ARL, else deemix .arl file)")
     p.add_argument("--skip-fallback-check", action="store_true",
                    help="don't warn when the server has bitrate fallback disabled")
+    p.add_argument("--no-ai", action="store_true",
+                   help="disable AI artist disambiguation even if OLLAMA_API_KEY is set")
     p.add_argument("--dry-run", action="store_true",
                    help="list what would be queued; queue nothing (no login)")
     return p.parse_args()
@@ -154,9 +176,11 @@ def main():
     if not lines:
         sys.exit(f"No artists found in {args.artists}")
 
-    log.info("server=%s  quality=%s (bitrate %d)  types=%s  artists=%d  dry_run=%s",
+    use_ai = dc.ai_enabled() and not args.no_ai
+    log.info("server=%s  quality=%s (bitrate %d)  types=%s  artists=%d  dry_run=%s  ai=%s",
              server, quality_name, bitrate, ",".join(sorted(want)), len(lines),
-             args.dry_run)
+             args.dry_run, ("on:" + os.environ.get("OLLAMA_MODEL", "gemini-3-flash-preview"))
+             if use_ai else "off")
 
     client = dc.Client(server)
     if not args.dry_run:
@@ -182,21 +206,27 @@ def main():
             except Exception:  # noqa: BLE001
                 pass
 
+    manifest = dc.load_manifest()
+    if not args.dry_run:
+        manifest["artists_file"] = args.artists
+
     total_queued = grand_total = 0
     for entry in lines:
         log.info("artist: %s", entry)
         try:
-            artist = resolve_artist(entry)
+            artist = resolve_artist(entry, use_ai)
         except Exception as e:  # noqa: BLE001
             log.error("  lookup failed: %s", e)
             continue
         if not artist:
             log.error("  no Deezer artist found")
             continue
+        tag = " [AI]" if artist.get("ai") else ""
         if artist["matched"]:
-            log.info("  = %s (id %s)", artist["name"], artist["id"])
+            log.info("  = %s (id %s)%s", artist["name"], artist["id"], tag)
         else:
-            log.warning("  ~ resolved to '%s' (id %s) - verify", artist["name"], artist["id"])
+            log.warning("  ~ resolved to '%s' (id %s)%s - verify",
+                        artist["name"], artist["id"], tag)
 
         try:
             all_albums = get_all_albums(artist["id"])
@@ -243,6 +273,12 @@ def main():
                 log.warning("    rejected: %s (%s)", al.get("title", ""), errid)
             time.sleep(0.25)
         log.info("  queued %d/%d", queued_here, len(picked))
+        if queued_here:
+            manifest["entries"] = [e for e in manifest["entries"]
+                                   if e.get("id") != artist["id"]]
+            manifest["entries"].append({"line": entry, "id": artist["id"],
+                                        "name": artist["name"]})
+            dc.save_manifest(manifest)
 
     if args.dry_run:
         log.info("DRY RUN complete: %d release(s) would be queued.", grand_total)

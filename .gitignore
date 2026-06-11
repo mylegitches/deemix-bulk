@@ -5,6 +5,9 @@
 # personal artist list -- ship artists.example.txt instead.
 # delete the next line if you WANT to track your own list.
 artists.txt
+artistsFULL.txt
+_ptest.txt
+_ptest.txt.bak
 
 # deemix-gui server binary + its vendor readme (download separately; see README)
 *.exe
