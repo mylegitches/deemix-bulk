@@ -1,0 +1,20 @@
+# secrets / local config
+.env
+.arl
+
+# personal artist list -- ship artists.example.txt instead.
+# delete the next line if you WANT to track your own list.
+artists.txt
+
+# deemix-gui server binary + its vendor readme (download separately; see README)
+*.exe
+Readme.txt
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# os cruft
+.DS_Store
+Thumbs.db
