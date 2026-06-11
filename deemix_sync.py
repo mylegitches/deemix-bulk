@@ -136,6 +136,9 @@ def parse_args():
     p.add_argument("--once", action="store_true", help="single pass, then exit")
     p.add_argument("--copy", action="store_true",
                    help="copy to NAS and keep local copies (default: move)")
+    p.add_argument("--allow-incomplete", action="store_true",
+                   help="also move bands that finished with failed/partial releases "
+                        "(default: only move bands where every release completed)")
     p.add_argument("--dry-run", action="store_true",
                    help="report only; do not connect SMB or move anything")
     p.add_argument("--download-dir", default=None,
@@ -185,6 +188,7 @@ def main():
                  "copy" if args.copy else "move")
 
     synced = load_synced()
+    reported_incomplete = set()
     last_sig = None
     last_change = time.time()
     stuck_reported = False
@@ -222,7 +226,7 @@ def main():
         log.info("queue: %d items | %d waiting, %d downloading | %d/%d bands terminal",
                  len(q), n_wait, n_dl, len(done_bands), len(bands))
 
-        # ---- move finished bands ------------------------------------------ #
+        # ---- move finished bands (only fully-completed ones) -------------- #
         for band in done_bands:
             items = bands[band]
             comp, werr, fail = classify(items)
@@ -231,23 +235,26 @@ def main():
             if key in synced:
                 continue
 
-            level = log.info if (werr == 0 and fail == 0) else log.warning
-            level("BAND DONE: %s  [%d completed, %d withErrors, %d failed]",
-                  band, comp, werr, fail)
-            for it in items:
-                if it.get("status") in ("failed", "withErrors"):
-                    errs = it.get("errors") or []
-                    msg = errs[0].get("message") if errs else ""
-                    log.warning("    %s: %s (%s) %s", it.get("status"),
-                                it.get("title"), it.get("artist"), msg)
+            fully_completed = (werr == 0 and fail == 0)
+            if not fully_completed and not args.allow_incomplete:
+                # finished, but with failures -> leave local for retry, don't move
+                if key not in reported_incomplete:
+                    log.warning("BAND INCOMPLETE: %s  [%d completed, %d withErrors, %d failed]"
+                                " - NOT moving (fix/retry, then re-run)", band, comp, werr, fail)
+                    for it in items:
+                        if it.get("status") in ("failed", "withErrors"):
+                            errs = it.get("errors") or []
+                            msg = errs[0].get("message") if errs else ""
+                            log.warning("    %s: %s %s", it.get("status"), it.get("title"), msg)
+                    reported_incomplete.add(key)
+                continue
+
+            tag = "BAND DONE" if fully_completed else "BAND DONE (incomplete, forced)"
+            log.info("%s: %s  [%d completed, %d withErrors, %d failed]",
+                     tag, band, comp, werr, fail)
 
             if not src or not os.path.isdir(src):
-                if comp == 0:
-                    log.warning("    no local folder (all failed?) - nothing to move: %s", band)
-                else:
-                    log.warning("    local folder not found for %s: %s", band, src)
-                synced.add(key)
-                save_synced(synced)
+                log.warning("    local folder not found, skipping: %s", src)
                 continue
 
             if args.dry_run:
