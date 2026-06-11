@@ -83,6 +83,81 @@ def find_arl(cli=None):
 
 
 # --------------------------------------------------------------------------- #
+# Ollama (cloud) -- optional AI disambiguation of ambiguous artist names
+# --------------------------------------------------------------------------- #
+def ai_enabled():
+    return bool(os.environ.get("OLLAMA_API_KEY"))
+
+
+def ollama_chat(messages, model=None, timeout=60):
+    key = os.environ.get("OLLAMA_API_KEY")
+    if not key:
+        raise RuntimeError("OLLAMA_API_KEY not set")
+    # Use OLLAMA_URL, not OLLAMA_HOST -- the latter is commonly set to a bind
+    # address (e.g. 0.0.0.0) by a local Ollama install and isn't a client URL.
+    base = os.environ.get("OLLAMA_URL", "https://ollama.com").rstrip("/")
+    if not base.startswith("http"):
+        base = "https://ollama.com"
+    model = model or os.environ.get("OLLAMA_MODEL", "gemini-3-flash-preview")
+    body = json.dumps({"model": model, "messages": messages,
+                       "stream": False}).encode("utf-8")
+    req = urllib.request.Request(
+        base + "/api/chat", data=body, method="POST",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))["message"]["content"]
+
+
+def ai_pick_artist(query, candidates, model=None):
+    """Pick the best Deezer artist for `query` from `candidates` (dicts with
+    id/name/nb_fan). Returns the chosen id (int) or None. Best-effort: any
+    failure returns None so the caller can fall back to the heuristic."""
+    if not candidates:
+        return None
+    lines = [f'{i+1}) id={c["id"]} name="{c["name"]}" fans={c.get("nb_fan", 0)}'
+             for i, c in enumerate(candidates)]
+    prompt = (
+        "Match a user's music-artist name to the correct Deezer artist.\n"
+        f'Query: "{query}"\n'
+        "Candidates:\n" + "\n".join(lines) + "\n\n"
+        "Choose the candidate the user most likely means (the well-known "
+        "recording artist with that name; use fan counts as a tie-breaker). "
+        "Reply with ONLY the numeric Deezer id, or NONE.")
+    try:
+        out = ollama_chat([{"role": "user", "content": prompt}], model=model).strip()
+    except Exception:  # noqa: BLE001
+        return None
+    ids = {str(c["id"]): c["id"] for c in candidates}
+    # exact id substring match (ids are long enough to be unambiguous)
+    for sid, real in ids.items():
+        if sid in out:
+            return real
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# manifest -- maps each queued artist back to its original artists.txt line,
+# so phase 2 can remove the line after the band is moved (handles id/URL lines)
+# --------------------------------------------------------------------------- #
+STATE_DIR = "state"
+MANIFEST_FILE = os.path.join(STATE_DIR, "manifest.json")
+
+
+def load_manifest():
+    try:
+        with open(MANIFEST_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"artists_file": None, "entries": []}
+
+
+def save_manifest(m):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(MANIFEST_FILE, "w", encoding="utf-8") as f:
+        json.dump(m, f, indent=1, ensure_ascii=False)
+
+
+# --------------------------------------------------------------------------- #
 # deemix-gui client
 # --------------------------------------------------------------------------- #
 class ServerDown(Exception):

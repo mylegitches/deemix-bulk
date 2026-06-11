@@ -76,7 +76,12 @@ def smb_connect(host, share, user, password, log):
 
 def merge_move(src, dst, copy_only=False):
     """Move (or copy) src into dst, merging into existing folders and
-    overwriting existing files. Removes emptied source dirs when moving."""
+    overwriting existing files. Removes emptied source dirs when moving.
+
+    Idempotent: if a file was already moved in a prior partial attempt
+    (src missing but dst exists), it is treated as success so a retry
+    after a partial failure completes cleanly.
+    Retries up to 3x on WinError 32 (file in use) with a short sleep."""
     if os.path.isdir(src):
         os.makedirs(dst, exist_ok=True)
         for name in os.listdir(src):
@@ -87,16 +92,52 @@ def merge_move(src, dst, copy_only=False):
             except OSError:
                 pass
     else:
+        if not os.path.exists(src):
+            if os.path.exists(dst):
+                return  # already moved in a prior partial attempt — skip
+            raise FileNotFoundError(f"not at source or destination: {src}")
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         if os.path.exists(dst):
             os.remove(dst)
-        if copy_only:
-            shutil.copy2(src, dst)
-        else:
-            shutil.move(src, dst)
+        for attempt in range(3):
+            try:
+                if copy_only:
+                    shutil.copy2(src, dst)
+                else:
+                    shutil.move(src, dst)
+                return
+            except PermissionError:
+                if attempt < 2:
+                    time.sleep(3)  # WinError 32: deemix still writing, retry
+                else:
+                    raise
 
 
 # --------------------------------------------------------------------------- #
+def prune_artist_lines(artists_file, targets, log):
+    """Remove non-comment lines whose text (lowercased) is in `targets`.
+    Writes a one-time .bak backup. Returns the number of lines removed."""
+    if not artists_file or not os.path.isfile(artists_file):
+        log.warning("    cannot prune - artists file not found: %s", artists_file)
+        return 0
+    with open(artists_file, encoding="utf-8") as f:
+        lines = f.readlines()
+    out, removed = [], 0
+    for ln in lines:
+        s = ln.strip()
+        if s and not s.startswith("#") and s.lower() in targets:
+            removed += 1
+            continue
+        out.append(ln)
+    if removed:
+        bak = artists_file + ".bak"
+        if not os.path.exists(bak):
+            shutil.copy2(artists_file, bak)
+        with open(artists_file, "w", encoding="utf-8") as f:
+            f.writelines(out)
+    return removed
+
+
 def artist_folder_of(items):
     """Best local artist-folder path for a band, from its terminal items."""
     for it in items:
@@ -139,6 +180,12 @@ def parse_args():
     p.add_argument("--allow-incomplete", action="store_true",
                    help="also move bands that finished with failed/partial releases "
                         "(default: only move bands where every release completed)")
+    p.add_argument("--prune-artists", action="store_true",
+                   help="after a band is moved, remove its line from the artists "
+                        "file (a .bak backup is written). File comes from the phase-1 "
+                        "manifest unless --artists-file is given.")
+    p.add_argument("--artists-file", default=None,
+                   help="artists list to prune (default: from the manifest)")
     p.add_argument("--dry-run", action="store_true",
                    help="report only; do not connect SMB or move anything")
     p.add_argument("--download-dir", default=None,
@@ -189,9 +236,19 @@ def main():
 
     synced = load_synced()
     reported_incomplete = set()
+    move_failed = set()  # bands where a move was attempted and failed this session
+    manifest = dc.load_manifest()
+    artists_file = args.artists_file or manifest.get("artists_file")
+    if args.prune_artists:
+        log.info("prune: will remove moved bands from %s", artists_file or "(none found)")
     last_sig = None
     last_change = time.time()
     stuck_reported = False
+    # deemix-gui removes completed items from the queue immediately after
+    # download finishes, so we may never observe status="completed" in a poll.
+    # Track the last-known state of each item so that when an active item
+    # disappears we can inject it back as completed for this pass.
+    seen_items = {}
 
     while True:
         try:
@@ -202,6 +259,16 @@ def main():
                 break
             time.sleep(args.interval)
             continue
+
+        # Inject items that vanished while still active as "completed" so
+        # they get moved/pruned in this pass.
+        for uuid, snap in list(seen_items.items()):
+            if uuid not in q and snap.get("status") not in TERMINAL:
+                snap = dict(snap)
+                snap["status"] = "completed"
+                q[uuid] = snap
+        for uuid, item in q.items():
+            seen_items[uuid] = dict(item)
 
         # ---- stuck detection ---------------------------------------------- #
         active = [v for v in q.values() if v.get("status") not in TERMINAL]
@@ -250,8 +317,11 @@ def main():
                 continue
 
             tag = "BAND DONE" if fully_completed else "BAND DONE (incomplete, forced)"
-            log.info("%s: %s  [%d completed, %d withErrors, %d failed]",
-                     tag, band, comp, werr, fail)
+            if key not in move_failed:
+                log.info("%s: %s  [%d completed, %d withErrors, %d failed]",
+                         tag, band, comp, werr, fail)
+            else:
+                log.info("retrying move: %s", band)
 
             if not src or not os.path.isdir(src):
                 log.warning("    local folder not found, skipping: %s", src)
@@ -263,13 +333,46 @@ def main():
                 continue
 
             dst = os.path.join(dest_base, os.path.basename(src))
-            try:
-                merge_move(src, dst, copy_only=args.copy)
-                log.info("    %s -> %s", "copied" if args.copy else "moved", dst)
-                synced.add(key)
-                save_synced(synced)
-            except Exception as e:  # noqa: BLE001
-                log.error("    move FAILED for %s: %s", band, e)
+            moved = False
+            for attempt in range(2):
+                try:
+                    merge_move(src, dst, copy_only=args.copy)
+                    log.info("    %s -> %s", "copied" if args.copy else "moved", dst)
+                    synced.add(key)
+                    save_synced(synced)
+                    move_failed.discard(key)
+                    moved = True
+                    break
+                except OSError as e:  # noqa: BLE001
+                    winerr = getattr(e, "winerror", 0)
+                    if attempt == 0 and winerr in (53, 59) and not args.dry_run:
+                        log.warning("    SMB error %d — reconnecting and retrying…", winerr)
+                        try:
+                            smb_connect(host, share, user, password, log)
+                        except Exception as ce:  # noqa: BLE001
+                            log.error("    SMB reconnect failed: %s", ce)
+                            log.error("    move FAILED for %s: %s", band, e)
+                            move_failed.add(key)
+                            break
+                    else:
+                        log.error("    move FAILED for %s: %s", band, e)
+                        move_failed.add(key)
+                        break
+            if not moved:
+                continue
+
+            if args.prune_artists and not args.copy:
+                targets = {band.strip().lower()}
+                for e in manifest.get("entries", []):
+                    if e.get("name", "").strip().lower() == band.strip().lower():
+                        targets.add(str(e.get("line", "")).strip().lower())
+                n = prune_artist_lines(artists_file, targets, log)
+                if n:
+                    log.info("    pruned %d line(s) from %s", n, artists_file)
+                    manifest["entries"] = [e for e in manifest.get("entries", [])
+                                           if e.get("name", "").strip().lower()
+                                           != band.strip().lower()]
+                    dc.save_manifest(manifest)
 
         # ---- loop control ------------------------------------------------- #
         if args.once:
