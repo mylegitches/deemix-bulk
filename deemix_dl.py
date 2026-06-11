@@ -110,6 +110,8 @@ def parse_args():
                    help="deemix-gui base URL (else DEEMIX_SERVER)")
     p.add_argument("--arl", default=None,
                    help="Deezer ARL (else DEEMIX_ARL, else deemix .arl file)")
+    p.add_argument("--skip-fallback-check", action="store_true",
+                   help="don't warn when the server has bitrate fallback disabled")
     p.add_argument("--dry-run", action="store_true",
                    help="list what would be queued; queue nothing (no login)")
     return p.parse_args()
@@ -169,6 +171,16 @@ def main():
         except Exception as e:  # noqa: BLE001
             sys.exit(f"Could not log in: {e}")
         log.info("logged in as: %s", user)
+
+        if not args.skip_fallback_check:
+            try:
+                if not client.settings().get("fallbackBitrate"):
+                    log.warning("server has bitrate fallback DISABLED - tracks without "
+                                "%s will FAIL instead of downloading a lower quality. "
+                                "Set fallbackBitrate=true in the deemix config and restart "
+                                "the server.", quality_name)
+            except Exception:  # noqa: BLE001
+                pass
 
     total_queued = grand_total = 0
     for entry in lines:

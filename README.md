@@ -115,12 +115,19 @@ python deemix_sync.py                                  # leave running; bands la
   `url.split is not a function`). Bitrate: `9`=FLAC, `3`=MP3 320, `1`=MP3 128.
 - **Queue items** expose `status`, `size`, `downloaded`, `failed`, `errors[]`,
   and (once downloaded) `artistPath` / `albumPath` / `files[].path`.
+- **`POST /api/saveSettings` is broken** (HTTP 500) in this build — the UI saves
+  settings over socket.io. Change settings in `config.json` and restart instead.
 
 ## Troubleshooting
 
 - **Lots of `failed` / `wrongBitrateNoAlternative`** — the track has no FLAC and
-  fallback is off. In deemix-gui settings enable *"Fallback to lower bitrates"*
-  (and/or search fallback) so it grabs MP3 instead of failing.
+  bitrate fallback is off, so deemix fails it instead of grabbing a lower
+  quality. Enable it by setting `"fallbackBitrate": true` (and
+  `"fallbackSearch": true`) in the deemix config
+  (`%APPDATA%\deemix\config.json`) and **restarting the server** — the REST
+  `saveSettings` endpoint is broken in this build, so the config file + restart
+  is the reliable way. `deemix_dl.py` warns at startup whenever the running
+  server still has fallback disabled (`--skip-fallback-check` to silence).
 - **`Cannot reach deemix server`** — server not running / wrong `DEEMIX_SERVER`.
 - **`Could not log in`** — bad/expired ARL (they last ~3 months; refresh it).
 - **`SMB connect failed`** — wrong `NAS_*` creds, share name, or the host is
