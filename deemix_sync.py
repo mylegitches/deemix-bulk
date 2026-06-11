@@ -63,10 +63,16 @@ def save_synced(synced):
 def smb_connect(host, share, user, password, log):
     unc = rf"\\{host}\{share}"
     # drop any stale mapping, then (re)connect with creds
-    subprocess.run(["net", "use", unc, "/delete", "/y"],
-                   capture_output=True, text=True)
-    r = subprocess.run(["net", "use", unc, password, f"/user:{user}"],
-                       capture_output=True, text=True)
+    try:
+        subprocess.run(["net", "use", unc, "/delete", "/y"],
+                       capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        pass  # stale cleanup timed out — proceed anyway
+    try:
+        r = subprocess.run(["net", "use", unc, password, f"/user:{user}"],
+                           capture_output=True, text=True, timeout=20)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"SMB connect timed out for {unc} (NAS unreachable?)")
     if r.returncode != 0:
         raise RuntimeError(f"SMB connect failed for {unc}: "
                            f"{(r.stderr or r.stdout).strip()}")
@@ -229,10 +235,14 @@ def main():
                                   "NAS_USER": user, "NAS_PASS": password}.items() if not v]
         if missing:
             sys.exit(f"Missing NAS config in .env: {', '.join(missing)}")
-        smb_connect(host, share, user, password, log)
         dest_base = os.path.join(rf"\\{host}\{share}", music_rel)
-        log.info("NAS destination: %s  (%s)", dest_base,
-                 "copy" if args.copy else "move")
+        try:
+            smb_connect(host, share, user, password, log)
+            log.info("NAS destination: %s  (%s)", dest_base,
+                     "copy" if args.copy else "move")
+        except RuntimeError as e:
+            log.warning("NAS not reachable at startup (%s) - will retry when a band finishes", e)
+            log.info("NAS destination (pending): %s", dest_base)
 
     synced = load_synced()
     reported_incomplete = set()
@@ -330,6 +340,15 @@ def main():
             if args.dry_run:
                 log.info("    [dry-run] would move %s -> %s\\%s",
                          src, dest_base or "<NAS>", os.path.basename(src))
+                continue
+
+            # Ensure SMB is connected before attempting a move (it may have
+            # been unavailable at startup or dropped since).
+            try:
+                smb_connect(host, share, user, password, log)
+            except RuntimeError as e:
+                log.warning("    NAS still unreachable, skipping %s for now: %s", band, e)
+                move_failed.add(key)
                 continue
 
             dst = os.path.join(dest_base, os.path.basename(src))
