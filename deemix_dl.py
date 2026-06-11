@@ -72,12 +72,19 @@ def resolve_artist(entry):
             return {"id": a["id"], "name": a["name"], "matched": True} if a.get("id") else None
         return None
     q = urllib.parse.quote(entry)
-    data = (deezer(f"/search/artist?q={q}&limit=5") or {}).get("data") or []
+    data = (deezer(f"/search/artist?q={q}&limit=10") or {}).get("data") or []
     if not data:
         return None
+    # Prefer an exact (case-insensitive) name match, most-followed first; this
+    # avoids Deezer's relevance ranking handing back the wrong same-ish artist
+    # (e.g. "Unida" -> "Unidad de Musica de la Guardia Real"). Falls back to the
+    # top search hit (flagged as unmatched) when nothing matches exactly.
+    exact = [d for d in data if d["name"].strip().lower() == entry.lower()]
+    if exact:
+        top = max(exact, key=lambda d: d.get("nb_fan", 0))
+        return {"id": top["id"], "name": top["name"], "matched": True}
     top = data[0]
-    return {"id": top["id"], "name": top["name"],
-            "matched": top["name"].strip().lower() == entry.lower()}
+    return {"id": top["id"], "name": top["name"], "matched": False}
 
 
 def get_all_albums(artist_id):
